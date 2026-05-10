@@ -1,0 +1,24 @@
+services:
+  ersatztv:
+    image: ghcr.io/ersatztv/legacy:latest
+    container_name: ersatztv
+    environment:
+      - TZ=${TZ:-America/Chicago}
+    ports:
+      - "${ETV_PORT:-8409}:8409"
+    volumes:
+      # Persistent config (database, settings, etc.)
+      - ${ETV_CONFIG_PATH:-./ersatztv-config}:/config
+      # Your local media — mounted read-only inside the container
+      # The container path MUST match what you tell ErsatzTV when adding library paths
+      - ${MEDIA_PATH}:${MEDIA_PATH}:ro
+    # tmpfs: keeps transcoded segments in RAM, saves SSD writes
+    tmpfs:
+      - /transcode
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8409/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
