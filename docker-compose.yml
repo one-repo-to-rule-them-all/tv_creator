@@ -9,9 +9,10 @@ services:
     volumes:
       # Persistent config (database, settings, etc.)
       - ${ETV_CONFIG_PATH:-./ersatztv-config}:/config
-      # Your local media — mounted read-only inside the container
-      # The container path MUST match what you tell ErsatzTV when adding library paths
-      - ${MEDIA_PATH}:${MEDIA_PATH}:ro
+      # NAS share mounted read-only inside the container at /nas
+      # Host path: \\wdmycloud\public (Z: drive)
+      # Docker Desktop on Windows: use forward slashes and UNC-style path
+      - ${NAS_HOST_PATH:-//wdmycloud/public}:/nas:ro
     # tmpfs: keeps transcoded segments in RAM, saves SSD writes
     tmpfs:
       - /transcode
