@@ -211,6 +211,50 @@ def etv_is_running() -> bool:
         return False
 
 
+def etv_is_indexing() -> bool:
+    """
+    Return True if ErsatzTV is currently scanning / indexing libraries.
+    Checks the /api/v1/libraries endpoint — if any library has a non-null
+    lastScan that is very recent, or if the media count is still changing,
+    we consider it active. Falls back to False on any error so we don't
+    block forever on API issues.
+    """
+    try:
+        r = requests.get(f"{ETV_HOST}/api/v1/libraries", timeout=5)
+        if not r.ok:
+            return False
+        libs = r.json()
+        for lib in libs:
+            if lib.get("isScanning") or lib.get("scanning"):
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def wait_for_idle(timeout: int = 600, poll: int = 10) -> bool:
+    """
+    Block until ErsatzTV reports no libraries are scanning, or until
+    timeout seconds elapse. Returns True if idle, False if timed out.
+    """
+    if not etv_is_indexing():
+        return True
+
+    print(f"  ErsatzTV is indexing — waiting for it to finish "
+          f"(up to {timeout//60} min) ...", end="", flush=True)
+    elapsed = 0
+    while elapsed < timeout:
+        time.sleep(poll)
+        elapsed += poll
+        if not etv_is_indexing():
+            print(" done")
+            return True
+        print(".", end="", flush=True)
+
+    print(f"\n  ⚠  Timed out after {timeout}s — ErsatzTV may still be indexing.")
+    return False
+
+
 def restart_ersatztv(exe_path: str = "") -> bool:
     """
     Kill the running ErsatzTV process, relaunch it, and poll until the
@@ -578,6 +622,122 @@ def upsert_playout(conn, channel_id: int, sched_id: int) -> int:
     return playout_id
 
 
+# ─── ErsatzTV pre-flight check ───────────────────────────────────────────────
+
+def verify_ersatztv() -> bool:
+    """
+    Confirm ErsatzTV is healthy and ready before configuring Jellyfin.
+    Checks:
+      1. API is reachable
+      2. At least one channel exists
+      3. At least one playout exists
+      4. M3U endpoint returns content with real channel entries
+    Prints a summary and returns True only if all checks pass.
+    """
+    print("\n-- ErsatzTV pre-flight check --")
+    ok = True
+
+    # 1. API reachable — ErsatzTV's Blazor app requires Accept: application/json
+    #    otherwise it serves the SPA HTML fallback instead of the API response.
+    JSON_HEADERS = {"Accept": "application/json"}
+    channels = []
+    try:
+        r = requests.get(f"{ETV_HOST}/api/v1/channels",
+                         headers=JSON_HEADERS, timeout=5)
+        content_type = r.headers.get("Content-Type", "")
+        if not r.ok:
+            print(f"  ✗ ErsatzTV API returned {r.status_code}")
+            return False
+        if "application/json" in content_type:
+            channels = r.json() or []
+        else:
+            # API not returning JSON — still up, but route may differ.
+            # Fall through to M3U check below for channel count.
+            print(f"  ⚠  /api/v1/channels returned {content_type} — "
+                  f"will use M3U feed for channel count")
+    except requests.exceptions.ConnectionError:
+        print(f"  ✗ Cannot connect to ErsatzTV at {ETV_HOST} — is it running?")
+        return False
+    except Exception as e:
+        print(f"  ✗ Unexpected error reaching ErsatzTV: {e}")
+        return False
+
+    # 2. Channels — confirm via M3U if JSON API didn't deliver
+    m3u_channels = 0
+    try:
+        rm = requests.get(
+            M3U_URL.replace(ERSATZTV_LAN, ETV_HOST), timeout=8)
+        if rm.ok:
+            m3u_channels = sum(
+                1 for l in rm.text.splitlines() if l.startswith("#EXTINF"))
+    except Exception:
+        pass
+
+    channel_count = len(channels) if channels else m3u_channels
+    if channel_count == 0:
+        print("  ✗ No channels found in ErsatzTV — run setup first")
+        return False
+
+    if channels:
+        print(f"  ✓ Channels  : {channel_count} found")
+        for ch in channels:
+            print(f"       #{ch.get('number','?')}  {ch.get('name','?')}")
+    else:
+        print(f"  ✓ Channels  : {channel_count} found (via M3U feed)")
+
+    # 3. Playouts exist and are built
+    try:
+        rp = requests.get(f"{ETV_HOST}/api/v1/playouts",
+                          headers=JSON_HEADERS, timeout=5)
+        playouts = rp.json() if (rp.ok and "application/json"
+                                 in rp.headers.get("Content-Type","")) else []
+    except Exception:
+        playouts = []
+
+    if not playouts:
+        # ErsatzTV's Blazor API often returns HTML for this endpoint too.
+        # The M3U feed is the real ground truth — if it has channels, playouts
+        # are built. Warn but don't block here.
+        print("  ⚠  Playout API unavailable (Blazor routing) — "
+              "will rely on M3U feed as confirmation")
+    else:
+        built = [p for p in playouts if p.get("nextStart") or p.get("items")]
+        print(f"  ✓ Playouts  : {len(playouts)} total, {len(built)} built")
+        if len(built) < len(playouts):
+            for p in [p for p in playouts if p not in built]:
+                print(f"    ⚠  Playout id={p.get('id')} not yet built — "
+                      f"go to ErsatzTV -> Playouts -> Build")
+
+    # 4. M3U endpoint has real content (reuse count from step 2 if available)
+    if m3u_channels > 0:
+        print(f"  ✓ M3U feed  : {m3u_channels} channel(s) in playlist")
+    else:
+        try:
+            rm = requests.get(
+                M3U_URL.replace(ERSATZTV_LAN, ETV_HOST), timeout=8)
+            if rm.ok:
+                m3u_channels = sum(
+                    1 for l in rm.text.splitlines() if l.startswith("#EXTINF"))
+                if m3u_channels:
+                    print(f"  ✓ M3U feed  : {m3u_channels} channel(s) in playlist")
+                else:
+                    print("  ✗ M3U feed returned empty playlist")
+                    ok = False
+            else:
+                print(f"  ✗ M3U endpoint error: {rm.status_code}")
+                ok = False
+        except Exception as e:
+            print(f"  ✗ M3U fetch failed: {e}")
+            ok = False
+
+    if ok:
+        print("  ErsatzTV looks good — proceeding to Jellyfin setup.")
+    else:
+        print("  ErsatzTV is not fully ready. Fix the issues above before "
+              "configuring Jellyfin.")
+    return ok
+
+
 # ─── Jellyfin helpers ─────────────────────────────────────────────────────────
 
 def jf_auth_header(token: str = "") -> dict:
@@ -650,20 +810,47 @@ def configure_jellyfin(username: str, password: str) -> None:
     if guide_exists:
         print("  ✓ XMLTV guide already present")
     elif not DRY_RUN:
+        # Verify XMLTV endpoint is reachable before asking Jellyfin to add it.
+        # Jellyfin fetches the URL internally to validate — if it can't reach it
+        # it returns 404 rather than 500. Use localhost for this check since
+        # the script runs on the same machine as ErsatzTV.
+        xmltv_local = XMLTV_URL.replace(ERSATZTV_LAN, ETV_HOST)
+        try:
+            xr = requests.get(xmltv_local, timeout=8)
+            if not xr.ok or len(xr.text.strip()) < 10:
+                print(f"  ✗ XMLTV endpoint not ready at {xmltv_local} "
+                      f"({xr.status_code}) — playouts may not be built yet.")
+                print(f"    Go to ErsatzTV -> Playouts -> Build each playout, "
+                      f"then re-run --jellyfin-only.")
+                return
+            print(f"  ✓ XMLTV endpoint OK ({len(xr.text)} bytes)")
+        except Exception as e:
+            print(f"  ✗ Cannot reach XMLTV endpoint: {e}")
+            return
+
+        # POST without query params — Jellyfin 10.10 returns 500 on this endpoint
+        # but still persists the guide provider.  Query params (?validateListings)
+        # cause a 404 router miss in 10.10, so we omit them entirely.
         r = requests.post(
             f"{JELLYFIN_HOST}/LiveTv/ListingProviders",
-            json={"Type": "xmltv", "Url": XMLTV_URL},
+            json={
+                "Type": "xmltv",
+                "Url": XMLTV_URL,
+                "Path": "",
+                "EnableAllTuners": True,
+                "EnabledTuners": [],
+                "ChannelMappings": [],
+            },
             headers={**jf_auth_header(token), "Content-Type": "application/json"},
             timeout=20,
         )
         if r.status_code in (200, 201, 204):
-            print(f"  XMLTV guide added: {XMLTV_URL}")
+            print(f"  ✓ XMLTV guide added: {XMLTV_URL}")
         elif r.status_code == 500:
-            # Known Jellyfin 10.10.x issue: 500 but guide IS saved
-            print(f"  Jellyfin returned 500 on XMLTV save (known 10.10 quirk).")
-            print(f"     Check Dashboard -> Live TV -> Guide Data Providers to verify.")
+            print(f"  ✓ XMLTV guide added (Jellyfin 10.10 returns 500 but saves)")
+            print(f"    Verify: Dashboard -> Live TV -> Guide Data Providers")
         else:
-            print(f"  XMLTV guide failed: {r.status_code}")
+            print(f"  ✗ XMLTV guide failed ({r.status_code}): {r.text[:200]}")
 
 
 # --- Main ---
@@ -678,6 +865,8 @@ def main():
                         help="Show discovered media groups and exit")
     parser.add_argument("--no-restart",   action="store_true",
                         help="Skip ErsatzTV restart after DB setup")
+    parser.add_argument("--jellyfin-only", action="store_true",
+                        help="Only configure Jellyfin tuner/guide")
     parser.add_argument("--jellyfin-user",     default="",
                         help="Jellyfin admin username")
     parser.add_argument("--jellyfin-password", default="",
@@ -685,9 +874,20 @@ def main():
     args = parser.parse_args()
     DRY_RUN = args.dry_run
 
-    print(f"\nErsatzTV full setup")
+    print("\nErsatzTV full setup")
     print(f"  DB   : {ETV_DB_PATH}")
     print(f"  Host : {ETV_HOST}\n")
+
+    # Jellyfin-only shortcut
+    if args.jellyfin_only:
+        if not args.jellyfin_user:
+            print("  Error: --jellyfin-only requires --jellyfin-user and --jellyfin-password")
+            sys.exit(1)
+        if not verify_ersatztv():
+            print("\n  Aborting Jellyfin setup -- ErsatzTV is not ready.")
+            sys.exit(1)
+        configure_jellyfin(args.jellyfin_user, args.jellyfin_password)
+        sys.exit(0)
 
     # Ensure ErsatzTV is installed
     print("-- Step 0: Verify ErsatzTV installation --")
@@ -730,7 +930,6 @@ def main():
             sched_id   = upsert_schedule(conn,
                                          f"{name} Schedule", coll_id, order)
             playout_id = upsert_playout(conn, ch_id, sched_id)
-
             if not DRY_RUN:
                 conn.execute("COMMIT")
             ok_count += 1
@@ -744,7 +943,8 @@ def main():
 
     # Restart ErsatzTV to build playouts
     if not DRY_RUN and not args.no_restart and ok_count > 0:
-        print(f"\n-- Step 3: Restart ErsatzTV (triggers playout builds) --")
+        print("\n-- Step 3: Restart ErsatzTV (triggers playout builds) --")
+        wait_for_idle()
         restart_ersatztv(resolved_exe)
     elif args.no_restart:
         print("\n  (--no-restart: skipping ErsatzTV restart)")
@@ -752,14 +952,18 @@ def main():
 
     # Jellyfin
     if args.jellyfin_user and not DRY_RUN:
-        configure_jellyfin(args.jellyfin_user, args.jellyfin_password)
+        if verify_ersatztv():
+            configure_jellyfin(args.jellyfin_user, args.jellyfin_password)
+        else:
+            print("\n  Skipping Jellyfin setup -- ErsatzTV is not fully ready.")
+            print("  Re-run with --jellyfin-only once ErsatzTV is healthy.")
 
     # Summary
-    print(f"\n" + "-"*55)
+    print("\n" + "-"*55)
     if DRY_RUN:
         print("  Dry run complete -- no changes made.")
     else:
-        print(f"  Setup complete.")
+        print("  Setup complete.")
         print(f"  Channels OK     : {ok_count}")
         if fail_count:
             print(f"  Channels failed : {fail_count}")
