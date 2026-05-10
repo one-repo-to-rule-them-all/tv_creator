@@ -1,679 +1,533 @@
 #!/usr/bin/env python3
 """
-ErsatzTV First-Run Setup
-────────────────────────
-Automates the full ErsatzTV onboarding flow:
-  1. Wait for ErsatzTV to be ready
-  2. Discover the live API from Swagger (adapts to any ErsatzTV version)
-  3. Add local library paths (Movies, Shows, etc.)
-  4. Trigger a media scan and wait for completion
-  5. Create a collection containing all scanned media
-  6. Create a channel (MPEG-TS mode — Jellyfin-compatible)
-  7. Create a classic schedule wired to the collection
-  8. Create a playout linking the channel to the schedule
-  9. Print M3U + XMLTV URLs ready to paste into Jellyfin
+setup.py — ErsatzTV end-to-end setup via direct SQLite database manipulation.
+
+ErsatzTV is a Blazor Server app with no REST API for setup operations.
+This script configures ErsatzTV by writing directly to its SQLite database.
 
 Usage:
-  pip install requests python-dotenv
-  cp .env.example .env      # edit .env with your actual paths
-  python setup.py
-
-If a step fails, run with --dump-api to print all discovered endpoints.
+    python setup.py                        # full setup
+    python setup.py --dry-run              # show what would be done, no writes
+    python setup.py --populate-collection  # add all scanned MediaItems to collection
+    python setup.py --status               # show current DB state
 """
-
-import os
-import sys
-import time
-import json
-import logging
 import argparse
-import re
+import os
+import random
+import sqlite3
+import sys
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 
-import requests
-from dotenv import load_dotenv
-
-# ─── Logging ──────────────────────────────────────────────────────────────────
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
-    datefmt="%H:%M:%S",
-)
-log = logging.getLogger("etv-setup")
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-load_dotenv()
+# Path to ErsatzTV SQLite database.
+# Docker default: ./ersatztv-config/ersatztv.sqlite3  (relative to this script)
+# Native default: %LOCALAPPDATA%\ersatztv\ersatztv.sqlite3
+_script_dir = Path(__file__).parent
+_default_db = str(_script_dir / "ersatztv-config" / "ersatztv.sqlite3")
 
-ETV_HOST         = os.getenv("ETV_HOST", "http://localhost:8409").rstrip("/")
-MEDIA_PATH       = os.getenv("MEDIA_PATH", "")
-MOVIES_SUBPATH   = os.getenv("MOVIES_SUBPATH", "Movies")
-SHOWS_SUBPATH    = os.getenv("SHOWS_SUBPATH", "Shows")
-CHANNEL_NUMBER   = int(os.getenv("CHANNEL_NUMBER", "1"))
-CHANNEL_NAME     = os.getenv("CHANNEL_NAME", "My Media")
-CHANNEL_GROUP    = os.getenv("CHANNEL_GROUP", "IPTV")
-SCHEDULE_NAME    = os.getenv("SCHEDULE_NAME", "My Media Schedule")
-COLLECTION_NAME  = os.getenv("COLLECTION_NAME", "All My Media")
+ETV_DB_PATH  = os.getenv("ETV_DB_PATH", _default_db)
+ETV_HOST     = os.getenv("ETV_HOST", "http://localhost:8409")
 
-# ─── HTTP helpers ─────────────────────────────────────────────────────────────
+# Base path inside the container (or on the host for native ErsatzTV).
+# Docker: /nas  (mounted from NAS via docker-compose)
+# Native: Z:/   (mapped NAS drive)
+NAS_CONTAINER_PATH = os.getenv("NAS_CONTAINER_PATH", "/nas").rstrip("/")
 
-SESSION = requests.Session()
-SESSION.headers.update({"Content-Type": "application/json", "Accept": "application/json"})
+CHANNEL_NUMBER   = os.getenv("CHANNEL_NUMBER",   "2")
+CHANNEL_NAME     = os.getenv("CHANNEL_NAME",     "My Media")
+CHANNEL_GROUP    = os.getenv("CHANNEL_GROUP",    "IPTV")
+SCHEDULE_NAME    = os.getenv("SCHEDULE_NAME",    "My Media Schedule")
+COLLECTION_NAME  = os.getenv("COLLECTION_NAME",  "All My Media")
 
+# ─── ErsatzTV enum constants ──────────────────────────────────────────────────
 
-def _json_or_raise(r: requests.Response, context: str = "") -> dict | list:
-    """Parse JSON response, raising a clear error if the body is HTML/empty."""
-    r.raise_for_status()
-    if not r.content:
-        return {}
-    ct = r.headers.get("content-type", "")
-    if "html" in ct:
-        raise RuntimeError(
-            f"ErsatzTV returned HTML instead of JSON for: {r.url}\n"
-            f"  This means the API path is wrong for your version.\n"
-            f"  Run with --dump-api to see all discovered endpoints.\n"
-            f"  Swagger UI: {ETV_HOST}/swagger"
-        )
-    try:
-        return r.json()
-    except Exception:
-        raise RuntimeError(
-            f"Non-JSON response ({ct}) from {r.url}:\n{r.text[:300]}"
-        )
+MEDIA_KIND_MOVIE       = 1
+MEDIA_KIND_SHOW        = 2
+MEDIA_KIND_MUSIC_VIDEO = 3
+MEDIA_KIND_OTHER_VIDEO = 4
 
+COLLECTION_TYPE_COLLECTION = 0   # regular hand-curated collection
 
-def _get(path: str, **kwargs) -> dict | list:
-    r = SESSION.get(f"{ETV_HOST}{path}", **kwargs)
-    return _json_or_raise(r, path)
+PLAYBACK_ORDER_SHUFFLE = 1       # shuffle items in the collection
 
+GUIDE_MODE_LIVE = 0
 
-def _post(path: str, body: dict = None, **kwargs) -> dict | list:
-    r = SESSION.post(f"{ETV_HOST}{path}", json=body or {}, **kwargs)
-    return _json_or_raise(r, path)
+SCHEDULE_KIND_PROGRAM = 0        # ProgramSchedule-backed playout
 
+STREAMING_MODE_MPEGTS = 5        # matches the ErsatzTV default channel
 
-def _put(path: str, body: dict = None, **kwargs) -> dict | list:
-    r = SESSION.put(f"{ETV_HOST}{path}", json=body or {}, **kwargs)
-    return _json_or_raise(r, path)
+# ─── Library definitions ──────────────────────────────────────────────────────
+# (display_name, media_kind, subpath_under_NAS_CONTAINER_PATH)
+# Paths become: {NAS_CONTAINER_PATH}/{subpath}
+LIBRARIES = [
+    ("Movies",          MEDIA_KIND_MOVIE,       "Movies"),
+    ("Tv Shows",        MEDIA_KIND_SHOW,        "Tv Shows"),
+    ("Fitness",         MEDIA_KIND_OTHER_VIDEO,  "Fitness"),
+    ("Stand up Comedy", MEDIA_KIND_OTHER_VIDEO,  "Stand up Comedy"),
+]
 
-# ─── Swagger discovery ────────────────────────────────────────────────────────
+# ─── Helpers ──────────────────────────────────────────────────────────────────
 
-# Populated by discover_api() at startup
-_SWAGGER_PATHS: dict = {}
-_API_PREFIX: str = "/api/v1"
+def now_utc_str() -> str:
+    """EF Core SQLite datetime format."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
 
-
-def discover_api() -> None:
-    """
-    Fetch the live Swagger/OpenAPI spec and build a path map.
-    Tries common Swagger JSON locations.
-    """
-    global _SWAGGER_PATHS, _API_PREFIX
-
-    candidates = [
-        "/swagger/v1/swagger.json",
-        "/api/swagger.json",
-        "/swagger.json",
-        "/api/v1/swagger.json",
-    ]
-
-    spec = None
-    for candidate in candidates:
-        try:
-            r = SESSION.get(f"{ETV_HOST}{candidate}", timeout=5)
-            if r.ok and "application/json" in r.headers.get("content-type", ""):
-                spec = r.json()
-                log.info(f"Swagger spec loaded from {candidate}")
-                break
-        except Exception:
-            continue
-
-    if spec is None:
-        log.warning(
-            "Could not load Swagger spec — using hardcoded paths. "
-            f"If calls fail, check {ETV_HOST}/swagger manually."
-        )
-        return
-
-    _SWAGGER_PATHS = spec.get("paths", {})
-
-    # Detect the API prefix from the paths (e.g. /api/v1 or /api/v2)
-    prefixes = set()
-    for p in _SWAGGER_PATHS:
-        m = re.match(r"^(/api/v\d+)", p)
-        if m:
-            prefixes.add(m.group(1))
-    if prefixes:
-        _API_PREFIX = sorted(prefixes)[0]
-        log.info(f"Detected API prefix: {_API_PREFIX}")
+def ok(msg: str):   print(f"  ✓  {msg}")
+def skip(msg: str): print(f"  -  {msg}")
+def warn(msg: str): print(f"  !  {msg}", file=sys.stderr)
+def info(msg: str): print(f"     {msg}")
 
 
-def api(path: str) -> str:
-    """Resolve a logical path to the full versioned API path."""
-    return f"{_API_PREFIX}{path}"
+class DB:
+    """Thin SQLite wrapper that respects --dry-run."""
 
+    def __init__(self, path: str, dry_run: bool = False):
+        self.path    = path
+        self.dry_run = dry_run
+        self._con: sqlite3.Connection | None = None
 
-def find_path(keyword: str, method: str = "get") -> Optional[str]:
-    """
-    Search the Swagger path map for a path containing 'keyword'.
-    Returns the first matching path or None.
-    """
-    keyword = keyword.lower()
-    for path, ops in _SWAGGER_PATHS.items():
-        if keyword in path.lower() and method.lower() in ops:
-            return path
-    return None
-
-
-def dump_api() -> None:
-    """Print all discovered endpoints — useful for debugging."""
-    if not _SWAGGER_PATHS:
-        print("No Swagger paths discovered. Check that ErsatzTV is running.")
-        return
-    print(f"\n{'─'*60}")
-    print(f"  Discovered {len(_SWAGGER_PATHS)} endpoints (prefix: {_API_PREFIX})")
-    print(f"{'─'*60}")
-    for path in sorted(_SWAGGER_PATHS):
-        methods = [m.upper() for m in _SWAGGER_PATHS[path] if m != "parameters"]
-        print(f"  {','.join(methods):20s}  {path}")
-    print()
-
-# ─── Step 1: Health check ─────────────────────────────────────────────────────
-
-def wait_for_ready(max_wait: int = 120) -> None:
-    """Poll /health until ErsatzTV responds."""
-    log.info(f"Waiting for ErsatzTV at {ETV_HOST} ...")
-    deadline = time.time() + max_wait
-    while time.time() < deadline:
-        try:
-            r = SESSION.get(f"{ETV_HOST}/health", timeout=5)
-            if r.ok:
-                log.info("ErsatzTV is ready ✓")
-                return
-        except requests.ConnectionError:
-            pass
-        time.sleep(3)
-    raise TimeoutError(
-        f"ErsatzTV did not respond in {max_wait}s. "
-        "Check: docker compose ps"
-    )
-
-# ─── Step 2: Local media source + libraries ───────────────────────────────────
-
-def get_local_media_source() -> dict:
-    """
-    Return the default local media source. Tries multiple known path patterns
-    across ErsatzTV versions and picks the first that returns valid JSON.
-    """
-    candidates = [
-        api("/mediaSources/local"),
-        api("/MediaSources/Local"),
-        api("/localMediaSources"),
-        api("/LocalMediaSources"),
-        api("/mediaSources"),
-        api("/MediaSources"),
-    ]
-
-    for path in candidates:
-        try:
-            r = SESSION.get(f"{ETV_HOST}{path}", timeout=10)
-            ct = r.headers.get("content-type", "")
-            if r.ok and "application/json" in ct:
-                data = r.json()
-                if data:
-                    sources = data if isinstance(data, list) else [data]
-                    # Filter to local sources if we got an unfiltered list
-                    local = [s for s in sources if s.get("sourceType", "").lower() in ("local", "") or "local" in s.get("name", "").lower()]
-                    result = (local or sources)[0]
-                    log.info(f"Local media source found via {path}: id={result.get('id')}")
-                    return result
-        except Exception:
-            continue
-
-    # Last resort: use Swagger discovery to find the right path
-    discovered = find_path("mediaSource") or find_path("mediasource") or find_path("library")
-    if discovered:
-        raise RuntimeError(
-            f"Could not get local media source via known paths.\n"
-            f"  Swagger suggests: {discovered}\n"
-            f"  Run --dump-api to see all endpoints and update this script."
-        )
-
-    raise RuntimeError(
-        "Could not find local media source endpoint.\n"
-        f"  Run with --dump-api or check {ETV_HOST}/swagger"
-    )
-
-
-def get_libraries(source_id: int) -> list:
-    """Fetch all libraries for the local media source."""
-    candidates = [
-        api(f"/mediaSources/local/libraries"),
-        api(f"/MediaSources/Local/Libraries"),
-        api(f"/libraries"),
-        api(f"/Libraries"),
-    ]
-    for path in candidates:
-        try:
-            r = SESSION.get(f"{ETV_HOST}{path}", timeout=10)
-            ct = r.headers.get("content-type", "")
-            if r.ok and "application/json" in ct:
-                data = r.json()
-                libs = data if isinstance(data, list) else data.get("items", [data])
-                if libs:
-                    log.info(f"Libraries found via {path} ({len(libs)} total)")
-                    return libs, path
-        except Exception:
-            continue
-    raise RuntimeError(
-        "Could not list libraries.\n"
-        f"  Run with --dump-api or check {ETV_HOST}/swagger"
-    )
-
-
-def add_library_path(lib_path_base: str, library_id: int, folder_path: str) -> None:
-    """Append a folder path to a library (idempotent)."""
-    # Try to get existing paths first
-    path_candidates = [
-        f"{lib_path_base}/{library_id}",
-        api(f"/mediaSources/local/libraries/{library_id}"),
-        api(f"/MediaSources/Local/Libraries/{library_id}"),
-    ]
-    for p in path_candidates:
-        try:
-            r = SESSION.get(f"{ETV_HOST}{p}", timeout=10)
-            if r.ok and "application/json" in r.headers.get("content-type", ""):
-                lib = r.json()
-                existing = [x["path"] for x in lib.get("paths", [])]
-                if folder_path in existing:
-                    log.info(f"  Path already registered: {folder_path}")
-                    return
-                break
-        except Exception:
-            continue
-
-    # Add the path
-    add_candidates = [
-        (f"{lib_path_base}/{library_id}/paths", {"path": folder_path}),
-        (api(f"/mediaSources/local/libraries/{library_id}/paths"), {"path": folder_path}),
-        (api(f"/mediaSources/local/libraries/{library_id}"), {"paths": [{"path": folder_path}]}),
-    ]
-    for add_path, body in add_candidates:
-        try:
-            r = SESSION.post(f"{ETV_HOST}{add_path}", json=body, timeout=10)
-            if r.ok:
-                log.info(f"  Added path: {folder_path}")
-                return
-        except Exception:
-            continue
-
-    log.warning(f"  Could not add path {folder_path} — you may need to add it manually via the UI.")
-
-
-def setup_libraries() -> tuple[list[int], str]:
-    """Register media sub-paths. Returns (library_ids, libraries_base_path)."""
-    if not MEDIA_PATH:
-        raise ValueError("MEDIA_PATH is not set in .env")
-
-    source = get_local_media_source()
-    source_id = source["id"]
-    libs, libs_base = get_libraries(source_id)
-
-    library_ids = []
-
-    for lib_type, subpath, label in [
-        ("Movie",  MOVIES_SUBPATH, "Movies"),
-        ("Show",   SHOWS_SUBPATH,  "Shows"),
-    ]:
-        if not subpath:
-            continue
-        folder = str(Path(MEDIA_PATH) / subpath)
-        match = next(
-            (l for l in libs if l.get("libraryType", "").lower() == lib_type.lower()),
-            None
-        )
-        if match:
-            log.info(f"Configuring {label} library (id={match['id']}) → {folder}")
-            add_library_path(libs_base, match["id"], folder)
-            library_ids.append(match["id"])
-        else:
-            log.warning(
-                f"No {label} ({lib_type}) library found. "
-                "ErsatzTV ships with default libraries — this is unexpected. "
-                "Add the path manually via the UI."
+    def connect(self):
+        db_path = Path(self.path)
+        if not db_path.exists():
+            sys.exit(
+                f"\nDatabase not found: {self.path}\n"
+                f"Is ErsatzTV running (or has it run at least once)?\n"
+                f"Check ETV_DB_PATH in your .env file.\n"
             )
+        self._con = sqlite3.connect(self.path, timeout=10)
+        self._con.row_factory = sqlite3.Row
+        self._con.execute("PRAGMA foreign_keys = ON")
+        self._con.execute("PRAGMA journal_mode = WAL")
 
-    return library_ids, libs_base
+    def close(self):
+        if self._con:
+            self._con.close()
 
-# ─── Step 3: Scan ─────────────────────────────────────────────────────────────
+    def __enter__(self):
+        self.connect()
+        return self
 
-def scan_libraries(library_ids: list[int], libs_base: str, wait: bool = True) -> None:
-    for lib_id in library_ids:
-        log.info(f"Triggering scan for library {lib_id} ...")
-        scan_paths = [
-            f"{libs_base}/{lib_id}/scan",
-            api(f"/libraries/{lib_id}/scan"),
-            api(f"/Libraries/{lib_id}/scan"),
-        ]
-        for sp in scan_paths:
-            try:
-                r = SESSION.post(f"{ETV_HOST}{sp}", json={}, timeout=10)
-                if r.status_code in (200, 202, 204):
-                    log.info(f"  Scan triggered via {sp}")
-                    break
-            except Exception:
-                continue
+    def __exit__(self, *_):
+        self.close()
 
-    if not wait:
-        log.info("Not waiting for scan completion (--no-wait-scan).")
+    def fetchone(self, sql: str, params=()):
+        return self._con.execute(sql, params).fetchone()
+
+    def fetchall(self, sql: str, params=()):
+        return self._con.execute(sql, params).fetchall()
+
+    def execute(self, sql: str, params=()):
+        """Execute a write statement, respecting dry_run."""
+        if self.dry_run:
+            preview = sql.strip()[:120].replace("\n", " ")
+            print(f"  [dry-run] {preview}")
+            return None
+        cur = self._con.execute(sql, params)
+        self._con.commit()
+        return cur
+
+    def lastrowid(self, sql: str, params=()) -> int:
+        if self.dry_run:
+            preview = sql.strip()[:120].replace("\n", " ")
+            print(f"  [dry-run] {preview}")
+            return -1
+        cur = self._con.execute(sql, params)
+        self._con.commit()
+        return cur.lastrowid
+
+
+# ─── Setup steps ──────────────────────────────────────────────────────────────
+
+def step_libraries(db: DB):
+    print("\n-- Libraries & Paths --")
+    local_source = db.fetchone("SELECT Id FROM LocalMediaSource LIMIT 1")
+    if not local_source:
+        sys.exit("No LocalMediaSource found. Has ErsatzTV initialised its DB?")
+    media_source_id = local_source["Id"]
+    ok(f"LocalMediaSource Id={media_source_id}")
+
+    for lib_name, media_kind, subpath in LIBRARIES:
+        container_path = f"{NAS_CONTAINER_PATH}/{subpath}"
+        print(f"\n  Library: '{lib_name}'  ({container_path})")
+
+        # Find or create the Library row
+        lib = db.fetchone(
+            "SELECT Id FROM Library WHERE Name=? AND MediaKind=? AND MediaSourceId=?",
+            (lib_name, media_kind, media_source_id),
+        )
+        if lib:
+            lib_id = lib["Id"]
+            skip(f"Library already exists (Id={lib_id})")
+        else:
+            lib_id = db.lastrowid(
+                "INSERT INTO Library (LastScan, MediaKind, MediaSourceId, Name) "
+                "VALUES (?,?,?,?)",
+                ("0001-01-01 00:00:00", media_kind, media_source_id, lib_name),
+            )
+            ok(f"Created Library (Id={lib_id})")
+            # LocalLibrary is the EF table-per-type child row (same PK as Library)
+            db.execute("INSERT INTO LocalLibrary (Id) VALUES (?)", (lib_id,))
+            ok(f"Created LocalLibrary (Id={lib_id})")
+
+        # Find or create the LibraryPath
+        existing_path = db.fetchone(
+            "SELECT Id FROM LibraryPath WHERE Path=? AND LibraryId=?",
+            (container_path, lib_id),
+        )
+        if existing_path:
+            skip(f"LibraryPath already exists (Id={existing_path['Id']})")
+        else:
+            path_id = db.lastrowid(
+                "INSERT INTO LibraryPath (Path, LibraryId, LastScan) VALUES (?,?,?)",
+                (container_path, lib_id, "0001-01-01 00:00:00"),
+            )
+            ok(f"Added LibraryPath (Id={path_id})  ->  {container_path}")
+
+
+def step_collection(db: DB) -> int:
+    print("\n-- Collection --")
+    existing = db.fetchone(
+        "SELECT Id FROM Collection WHERE Name=?", (COLLECTION_NAME,)
+    )
+    if existing:
+        coll_id = existing["Id"]
+        skip(f"Collection '{COLLECTION_NAME}' already exists (Id={coll_id})")
+        return coll_id
+
+    coll_id = db.lastrowid(
+        "INSERT INTO Collection (Name, UseCustomPlaybackOrder) VALUES (?,?)",
+        (COLLECTION_NAME, 0),
+    )
+    ok(f"Created Collection '{COLLECTION_NAME}' (Id={coll_id})")
+    return coll_id
+
+
+def step_channel(db: DB) -> int:
+    print("\n-- Channel --")
+    existing = db.fetchone(
+        "SELECT Id FROM Channel WHERE Number=?", (CHANNEL_NUMBER,)
+    )
+    if existing:
+        ch_id = existing["Id"]
+        skip(f"Channel {CHANNEL_NUMBER} already exists (Id={ch_id})")
+        return ch_id
+
+    ffmpeg_profile = db.fetchone("SELECT Id FROM FFmpegProfile WHERE Id=1")
+    if not ffmpeg_profile:
+        sys.exit("FFmpegProfile Id=1 not found. ErsatzTV may not be fully initialised.")
+
+    ch_id = db.lastrowid(
+        """
+        INSERT INTO Channel (
+            Categories, FFmpegProfileId, FallbackFillerId, "Group",
+            IdleBehavior, IsEnabled, MirrorSourceChannelId,
+            MusicVideoCreditsMode, MusicVideoCreditsTemplate,
+            Name, Number, PlayoutMode, PlayoutOffset, PlayoutSource,
+            PreferredAudioLanguageCode, PreferredAudioTitle,
+            PreferredSubtitleLanguageCode, ShowInEpg, SongVideoMode,
+            SortNumber, StreamSelector, StreamSelectorMode,
+            StreamingMode, SubtitleMode, TranscodeMode, UniqueId,
+            WatermarkId, SlugSeconds, StreamingEngine, NextEngineTextSubtitleMode
+        ) VALUES (
+            NULL, 1, NULL, ?,
+            0, 1, NULL,
+            0, NULL,
+            ?, ?, 0, NULL, 0,
+            NULL, NULL,
+            NULL, 1, 0,
+            ?, NULL, 0,
+            5, 0, 0, ?,
+            NULL, NULL, 0, 0
+        )
+        """,
+        (
+            CHANNEL_GROUP,
+            CHANNEL_NAME,
+            CHANNEL_NUMBER,
+            float(CHANNEL_NUMBER),
+            str(uuid.uuid4()).upper(),
+        ),
+    )
+    ok(f"Created Channel '{CHANNEL_NAME}' number={CHANNEL_NUMBER} (Id={ch_id})")
+    return ch_id
+
+
+def step_schedule(db: DB, coll_id: int) -> int:
+    print("\n-- Program Schedule --")
+    existing = db.fetchone(
+        "SELECT Id FROM ProgramSchedule WHERE Name=?", (SCHEDULE_NAME,)
+    )
+    if existing:
+        sched_id = existing["Id"]
+        skip(f"Schedule '{SCHEDULE_NAME}' already exists (Id={sched_id})")
+        item = db.fetchone(
+            "SELECT Id FROM ProgramScheduleItem "
+            "WHERE ProgramScheduleId=? AND CollectionId=?",
+            (sched_id, coll_id),
+        )
+        if not item:
+            _insert_flood_item(db, sched_id, coll_id)
+        else:
+            skip(f"Flood schedule item already exists (Id={item['Id']})")
+        return sched_id
+
+    sched_id = db.lastrowid(
+        """
+        INSERT INTO ProgramSchedule (
+            FixedStartTimeBehavior, KeepMultiPartEpisodesTogether,
+            Name, RandomStartPoint, ShuffleScheduleItems,
+            TreatCollectionsAsShows
+        ) VALUES (0, 0, ?, 1, 0, 0)
+        """,
+        (SCHEDULE_NAME,),
+    )
+    ok(f"Created ProgramSchedule '{SCHEDULE_NAME}' (Id={sched_id})")
+    _insert_flood_item(db, sched_id, coll_id)
+    return sched_id
+
+
+def _insert_flood_item(db: DB, sched_id: int, coll_id: int):
+    """Insert a FloodItem schedule entry referencing the given collection."""
+    item_id = db.lastrowid(
+        """
+        INSERT INTO ProgramScheduleItem (
+            CollectionId, CollectionType, CustomTitle, FakeCollectionKey,
+            FallbackFillerId, FillWithGroupMode, FixedStartTimeBehavior,
+            GuideMode, "Index", MarathonBatchSize, MarathonGroupBy,
+            MarathonShuffleGroups, MarathonShuffleItems, MediaItemId,
+            MidRollFillerId, MultiCollectionId, PlaybackOrder,
+            PlaylistId, PostRollFillerId, PreRollFillerId,
+            PreferredAudioLanguageCode, PreferredAudioTitle,
+            PreferredSubtitleLanguageCode, ProgramScheduleId,
+            RerunCollectionId, SmartCollectionId, StartTime,
+            SubtitleMode, TailFillerId, SearchQuery, SearchTitle
+        ) VALUES (
+            ?, 0, NULL, NULL,
+            NULL, 0, NULL,
+            0, 0, NULL, 0,
+            0, 0, NULL,
+            NULL, NULL, 1,
+            NULL, NULL, NULL,
+            NULL, NULL,
+            NULL, ?,
+            NULL, NULL, NULL,
+            NULL, NULL, NULL, NULL
+        )
+        """,
+        (coll_id, sched_id),
+    )
+    ok(f"Created ProgramScheduleItem (flood, CollectionId={coll_id}, Id={item_id})")
+    # ProgramScheduleFloodItem is the EF discriminator child row (same PK)
+    db.execute("INSERT INTO ProgramScheduleFloodItem (Id) VALUES (?)", (item_id,))
+    ok(f"Created ProgramScheduleFloodItem (Id={item_id})")
+
+
+def step_playout(db: DB, ch_id: int, sched_id: int):
+    print("\n-- Playout --")
+    existing = db.fetchone(
+        "SELECT Id FROM Playout WHERE ChannelId=? AND ProgramScheduleId=?",
+        (ch_id, sched_id),
+    )
+    if existing:
+        skip(f"Playout already exists (Id={existing['Id']})")
         return
 
-    log.info("Waiting for scans to complete (polling every 10s, max 10 min) ...")
-    timeout = time.time() + 600
-    while time.time() < timeout:
-        try:
-            # Try to detect active scans
-            for scan_status_path in [api("/libraries/scanning"), api("/Libraries/scanning")]:
-                r = SESSION.get(f"{ETV_HOST}{scan_status_path}", timeout=5)
-                if r.ok and "application/json" in r.headers.get("content-type", ""):
-                    scanning = r.json()
-                    ids_scanning = [s["id"] for s in (scanning if isinstance(scanning, list) else [])]
-                    if not any(lid in ids_scanning for lid in library_ids):
-                        log.info("Scan complete ✓")
-                        return
-                    break
-        except Exception:
-            pass
-        time.sleep(10)
+    seed = random.randint(1, 2**31 - 1)
+    playout_id = db.lastrowid(
+        """
+        INSERT INTO Playout (
+            ChannelId, DailyRebuildTime, DecoId, OnDemandCheckpoint,
+            ProgramScheduleId, ScheduleFile, ScheduleKind, Seed
+        ) VALUES (?, NULL, NULL, NULL, ?, NULL, 0, ?)
+        """,
+        (ch_id, sched_id, seed),
+    )
+    ok(f"Created Playout (Id={playout_id}, Seed={seed})")
 
-    log.warning("Scan status check timed out — continuing. Re-run after scanning finishes if items are missing.")
-
-# ─── Step 4: Collection ───────────────────────────────────────────────────────
-
-def find_or_create_collection(name: str) -> dict:
-    col_path = api("/collections")
-    try:
-        collections = _get(col_path)
-    except Exception:
-        col_path = api("/Collections")
-        collections = _get(col_path)
-
-    for col in (collections if isinstance(collections, list) else []):
-        if col.get("name") == name:
-            log.info(f"Collection exists: id={col['id']}  '{name}'")
-            return col, col_path
-
-    log.info(f"Creating collection: '{name}'")
-    col = _post(col_path, {"name": name})
-    log.info(f"  Created: id={col['id']}")
-    return col, col_path
+    next_start = now_utc_str()
+    db.execute(
+        """
+        INSERT INTO PlayoutAnchor (
+            PlayoutId, DurationFinish, InDurationFiller, InFlood,
+            MultipleRemaining, NextGuideGroup, NextStart,
+            NextInstructionIndex, Context
+        ) VALUES (?, NULL, 0, 0, NULL, 0, ?, 0, NULL)
+        """,
+        (playout_id, next_start),
+    )
+    ok(f"Created PlayoutAnchor (NextStart={next_start})")
 
 
-def populate_collection_from_libraries(collection_id: int, library_ids: list[int], libs_base: str) -> int:
-    added = 0
-    for lib_id in library_ids:
-        log.info(f"Fetching items from library {lib_id} ...")
-        page, page_size = 0, 100
-        items_path = None
-        for p in [f"{libs_base}/{lib_id}/items", api(f"/libraries/{lib_id}/items"), api(f"/Libraries/{lib_id}/items")]:
-            try:
-                r = SESSION.get(f"{ETV_HOST}{p}", params={"pageNumber": 0, "pageSize": 1}, timeout=10)
-                if r.ok and "application/json" in r.headers.get("content-type", ""):
-                    items_path = p
-                    break
-            except Exception:
-                continue
+def step_populate_collection(db: DB, coll_id: int):
+    print("\n-- Populate Collection --")
+    all_items = db.fetchall("SELECT Id FROM MediaItem")
+    if not all_items:
+        warn("No MediaItems found — has a library scan completed?")
+        info("Go to ErsatzTV UI -> Libraries -> Scan, then re-run:")
+        info("  python setup.py --populate-collection")
+        return
 
-        if not items_path:
-            log.warning(f"  Could not find items endpoint for library {lib_id} — skipping.")
-            continue
+    existing = {
+        r["MediaItemId"]
+        for r in db.fetchall(
+            "SELECT MediaItemId FROM CollectionItem WHERE CollectionId=?",
+            (coll_id,),
+        )
+    }
+    to_add = [r["Id"] for r in all_items if r["Id"] not in existing]
 
-        while True:
-            items = _get(items_path, params={"pageNumber": page, "pageSize": page_size})
-            item_list = items.get("items", items) if isinstance(items, dict) else items
-            if not item_list:
-                break
-            ids = [i["id"] for i in item_list if "id" in i]
-            if ids:
-                try:
-                    _post(api(f"/collections/{collection_id}/items"), {"mediaItemIds": ids})
-                    added += len(ids)
-                    log.info(f"  Added {len(ids)} items (page {page})")
-                except Exception:
-                    _post(api(f"/Collections/{collection_id}/items"), {"mediaItemIds": ids})
-                    added += len(ids)
-            if len(item_list) < page_size:
-                break
-            page += 1
+    if not to_add:
+        skip(f"All {len(all_items)} MediaItems already in collection.")
+        return
 
-    log.info(f"Collection populated: {added} items")
-    return added
-
-# ─── Step 5: Channel ──────────────────────────────────────────────────────────
-
-def get_default_ffmpeg_profile_id() -> int:
-    for p in [api("/ffmpegProfiles"), api("/FfmpegProfiles"), api("/ffmpeg/profiles")]:
-        try:
-            r = SESSION.get(f"{ETV_HOST}{p}", timeout=5)
-            if r.ok and "application/json" in r.headers.get("content-type", ""):
-                profiles = r.json()
-                pl = profiles if isinstance(profiles, list) else profiles.get("items", [profiles])
-                for prof in pl:
-                    if prof.get("name", "").lower() == "default":
-                        return prof["id"]
-                if pl:
-                    return pl[0]["id"]
-        except Exception:
-            continue
-    return 1
+    for media_id in to_add:
+        db.execute(
+            "INSERT INTO CollectionItem (CollectionId, MediaItemId, CustomIndex) "
+            "VALUES (?,?,NULL)",
+            (coll_id, media_id),
+        )
+    ok(
+        f"Added {len(to_add)} MediaItems to Collection (Id={coll_id}). "
+        f"{len(existing)} were already present."
+    )
 
 
-def find_or_create_channel(number: int, name: str, group: str) -> dict:
-    ch_path = api("/channels")
-    try:
-        channels = _get(ch_path)
-    except Exception:
-        ch_path = api("/Channels")
-        channels = _get(ch_path)
+def step_status(db: DB):
+    print("\n-- Current Database State --\n")
 
-    ch_list = channels if isinstance(channels, list) else channels.get("items", [])
-    for ch in ch_list:
-        if ch.get("number") == number:
-            log.info(f"Channel exists: id={ch['id']}  #{number} '{name}'")
-            return ch, ch_path
+    libs = db.fetchall(
+        "SELECT l.Id, l.Name, l.MediaKind, COUNT(lp.Id) AS path_count "
+        "FROM Library l LEFT JOIN LibraryPath lp ON lp.LibraryId=l.Id "
+        "GROUP BY l.Id ORDER BY l.Id"
+    )
+    print(f"  Libraries ({len(libs)}):")
+    for lib in libs:
+        mk = {1: "Movie", 2: "Show", 3: "MusicVideo", 4: "OtherVideo"}.get(
+            lib["MediaKind"], str(lib["MediaKind"])
+        )
+        print(f"    [{lib['Id']:2d}] {lib['Name']:<25s}  type={mk}  paths={lib['path_count']}")
 
-    profile_id = get_default_ffmpeg_profile_id()
-    log.info(f"Creating channel #{number}: '{name}'  (ffmpegProfileId={profile_id})")
-    ch = _post(ch_path, {
-        "number": number,
-        "name": name,
-        "ffmpegProfileId": profile_id,
-        "streamingMode": "TransportStream",
-        "groupTitle": group,
-        "progressiveSegmentCount": 0,
-    })
-    log.info(f"  Created: id={ch['id']}")
-    return ch, ch_path
+    paths = db.fetchall(
+        "SELECT lp.Id, lp.Path, lp.LibraryId FROM LibraryPath lp ORDER BY lp.LibraryId"
+    )
+    print(f"\n  LibraryPaths ({len(paths)}):")
+    for p in paths:
+        print(f"    [{p['Id']:2d}] lib={p['LibraryId']}  {p['Path']}")
 
-# ─── Step 6: Schedule ─────────────────────────────────────────────────────────
+    channels = db.fetchall(
+        'SELECT Id, Number, Name, "Group" FROM Channel ORDER BY Id'
+    )
+    print(f"\n  Channels ({len(channels)}):")
+    for ch in channels:
+        print(f"    [{ch['Id']:2d}] #{ch['Number']}  {ch['Name']}  (group: {ch['Group']})")
 
-def find_or_create_schedule(name: str) -> dict:
-    sched_path = api("/schedules")
-    try:
-        schedules = _get(sched_path)
-    except Exception:
-        sched_path = api("/Schedules")
-        schedules = _get(sched_path)
+    colls = db.fetchall(
+        "SELECT c.Id, c.Name, COUNT(ci.MediaItemId) AS item_count "
+        "FROM Collection c LEFT JOIN CollectionItem ci ON ci.CollectionId=c.Id "
+        "GROUP BY c.Id"
+    )
+    print(f"\n  Collections ({len(colls)}):")
+    for c in colls:
+        print(f"    [{c['Id']:2d}] {c['Name']}  ({c['item_count']} items)")
 
-    s_list = schedules if isinstance(schedules, list) else schedules.get("items", [])
-    for s in s_list:
-        if s.get("name") == name:
-            log.info(f"Schedule exists: id={s['id']}  '{name}'")
-            return s, sched_path
+    scheds = db.fetchall("SELECT Id, Name FROM ProgramSchedule ORDER BY Id")
+    print(f"\n  Schedules ({len(scheds)}):")
+    for s in scheds:
+        print(f"    [{s['Id']:2d}] {s['Name']}")
 
-    log.info(f"Creating schedule: '{name}'")
-    sched = _post(sched_path, {
-        "name": name,
-        "keepMultiPartEpisodesTogether": True,
-        "randomStartPoint": False,
-        "shuffleScheduleItems": False,
-        "treatCollectionsAsShows": False,
-    })
-    log.info(f"  Created: id={sched['id']}")
-    return sched, sched_path
+    playouts = db.fetchall(
+        "SELECT p.Id, p.ChannelId, p.ProgramScheduleId, ch.Name AS ch_name "
+        "FROM Playout p LEFT JOIN Channel ch ON ch.Id=p.ChannelId ORDER BY p.Id"
+    )
+    print(f"\n  Playouts ({len(playouts)}):")
+    for p in playouts:
+        print(f"    [{p['Id']:2d}] channel={p['ch_name']}  schedule={p['ProgramScheduleId']}")
 
+    media_count = db.fetchone("SELECT COUNT(*) AS n FROM MediaItem")
+    print(f"\n  MediaItems scanned: {media_count['n']}")
 
-def add_schedule_item(schedule_id: int, sched_path: str, collection_id: int) -> None:
-    items_path = f"{sched_path}/{schedule_id}/items"
-    try:
-        items = _get(items_path)
-        for item in (items if isinstance(items, list) else []):
-            coll = item.get("collection") or {}
-            if coll.get("id") == collection_id:
-                log.info(f"  Schedule item already exists for collection {collection_id}")
-                return
-    except Exception:
-        pass  # can't list — just try to add
-
-    log.info(f"Adding collection {collection_id} to schedule {schedule_id}")
-    _post(items_path, {
-        "collectionId": collection_id,
-        "collectionType": "Collection",
-        "playbackOrder": "Shuffle",
-        "startTime": None,
-        "playoutDuration": None,
-        "tailFiller": None,
-        "midRollFiller": None,
-        "multiplePlaybackEpisodes": None,
-        "incompletePlaybackHandling": "None",
-    })
-    log.info("  Schedule item added")
-
-# ─── Step 7: Playout ──────────────────────────────────────────────────────────
-
-def find_or_create_playout(channel_id: int, schedule_id: int) -> dict:
-    playout_path = api("/playouts")
-    try:
-        playouts = _get(playout_path)
-    except Exception:
-        playout_path = api("/Playouts")
-        playouts = _get(playout_path)
-
-    p_list = playouts if isinstance(playouts, list) else playouts.get("items", [])
-    for p in p_list:
-        if p.get("channelId") == channel_id:
-            log.info(f"Playout exists: id={p['id']}  channel={channel_id}")
-            return p
-
-    log.info(f"Creating playout: channel={channel_id}  schedule={schedule_id}")
-    playout = _post(playout_path, {
-        "channelId": channel_id,
-        "scheduleId": schedule_id,
-        "playoutType": "Classic",
-    })
-    log.info(f"  Created: id={playout['id']}")
-    return playout
-
-# ─── Output ───────────────────────────────────────────────────────────────────
-
-def print_jellyfin_config() -> None:
-    m3u_url   = f"{ETV_HOST}/iptv/channels.m3u?apikey="
-    xmltv_url = f"{ETV_HOST}/iptv/xmltv.xml?apikey="
-    sep = "─" * 60
-    print(f"\n{sep}")
-    print("  ErsatzTV → Jellyfin Configuration")
-    print(sep)
-    print()
-    print("  Jellyfin Admin Dashboard → Live TV:")
-    print()
-    print("  1. Add Tuner Device")
-    print("     Tuner Type : M3U Tuner")
-    print(f"     File / URL : {m3u_url}")
-    print()
-    print("  2. Add TV Guide Data Provider")
-    print("     Type       : XMLTV")
-    print(f"     URL        : {xmltv_url}")
-    print()
-    print("  (Append your ErsatzTV API key to both URLs if auth is enabled.)")
-    print(f"{sep}\n")
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
-def parse_args():
-    p = argparse.ArgumentParser(description="ErsatzTV first-run setup")
-    p.add_argument("--no-wait-scan", action="store_true",
-                   help="Don't block waiting for library scan")
-    p.add_argument("--skip-populate", action="store_true",
-                   help="Skip adding library items to the collection")
-    p.add_argument("--dump-api", action="store_true",
-                   help="Print all discovered API endpoints and exit")
-    p.add_argument("--dry-run", action="store_true",
-                   help="Print config and exit without making changes")
-    return p.parse_args()
-
-
 def main():
-    args = parse_args()
+    parser = argparse.ArgumentParser(description="ErsatzTV SQLite setup automation")
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Print what would be done without writing to the DB",
+    )
+    parser.add_argument(
+        "--populate-collection", action="store_true",
+        help="Add all scanned MediaItems to the collection (run after a library scan)",
+    )
+    parser.add_argument(
+        "--status", action="store_true",
+        help="Show current DB state and exit",
+    )
+    parser.add_argument(
+        "--db", default=ETV_DB_PATH, metavar="PATH",
+        help=f"Path to ersatztv.sqlite3 (default: {ETV_DB_PATH})",
+    )
+    args = parser.parse_args()
 
+    print(f"\n{'=' * 60}")
+    print(f"  ErsatzTV SQLite Setup")
+    print(f"  DB:  {args.db}")
+    print(f"  NAS: {NAS_CONTAINER_PATH}")
     if args.dry_run:
-        log.info("DRY RUN")
-        for k, v in [
-            ("ETV_HOST", ETV_HOST), ("MEDIA_PATH", MEDIA_PATH),
-            ("MOVIES_SUBPATH", MOVIES_SUBPATH), ("SHOWS_SUBPATH", SHOWS_SUBPATH),
-            ("CHANNEL_NAME", f"{CHANNEL_NAME} (#{CHANNEL_NUMBER})"),
-            ("SCHEDULE_NAME", SCHEDULE_NAME), ("COLLECTION_NAME", COLLECTION_NAME),
-        ]:
-            log.info(f"  {k:20s}: {v}")
-        print_jellyfin_config()
-        return
+        print("  MODE: DRY RUN -- no writes will be committed")
+    print(f"{'=' * 60}")
 
-    wait_for_ready()
-    discover_api()
+    with DB(args.db, dry_run=args.dry_run) as db:
 
-    if args.dump_api:
-        dump_api()
-        return
+        if args.status:
+            step_status(db)
+            return
 
-    log.info("── Libraries ──")
-    library_ids, libs_base = setup_libraries()
+        # Phase 1: configure library paths
+        step_libraries(db)
 
-    log.info("── Scan ──")
-    scan_libraries(library_ids, libs_base, wait=not args.no_wait_scan)
+        # Phase 2: collection
+        coll_id = step_collection(db)
 
-    log.info("── Collection ──")
-    collection, col_path = find_or_create_collection(COLLECTION_NAME)
-    if not args.skip_populate:
-        populate_collection_from_libraries(collection["id"], library_ids, libs_base)
+        # Phase 3: channel
+        ch_id = step_channel(db)
 
-    log.info("── Channel ──")
-    channel, _ = find_or_create_channel(CHANNEL_NUMBER, CHANNEL_NAME, CHANNEL_GROUP)
+        # Phase 4: schedule + flood item
+        sched_id = step_schedule(db, coll_id)
 
-    log.info("── Schedule ──")
-    schedule, sched_path = find_or_create_schedule(SCHEDULE_NAME)
-    add_schedule_item(schedule["id"], sched_path, collection["id"])
+        # Phase 5: playout + anchor
+        step_playout(db, ch_id, sched_id)
 
-    log.info("── Playout ──")
-    find_or_create_playout(channel["id"], schedule["id"])
+        # Phase 6 (optional): populate collection after scan
+        if args.populate_collection:
+            step_populate_collection(db, coll_id)
 
-    log.info("Setup complete ✓")
-    print_jellyfin_config()
+    # Final output
+    print(f"\n{'=' * 60}")
+    if args.dry_run:
+        print("  Dry run complete -- re-run without --dry-run to apply.")
+    else:
+        print("  Setup complete!\n")
+        print("  Next steps:")
+        print("  1. Restart ErsatzTV to pick up new library paths:")
+        print("       docker compose restart ersatztv")
+        print("  2. In ErsatzTV UI -> Libraries, click Scan for each library.")
+        print("  3. Once scanning finishes, populate the collection:")
+        print("       python setup.py --populate-collection")
+        print("  4. Add to Jellyfin Live TV:")
+        print(f"       M3U  : {ETV_HOST}/iptv/xmltv.m3u")
+        print(f"       XMLTV: {ETV_HOST}/iptv/xmltv.xml")
+    print(f"{'=' * 60}\n")
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        sys.exit(0)
-    except requests.HTTPError as e:
-        log.error(f"HTTP {e.response.status_code} — {e.response.url}")
-        try:
-            log.error(f"Body: {e.response.json()}")
-        except Exception:
-            log.error(f"Body: {e.response.text[:300]}")
-        log.error(f"Swagger UI: {ETV_HOST}/swagger  |  Run with --dump-api for endpoint list")
-        sys.exit(1)
-    except Exception as e:
-        log.error(str(e))
-        sys.exit(1)
+    main()
